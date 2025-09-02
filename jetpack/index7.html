@@ -1,0 +1,1090 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<title>JetCube</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  /* Stili CSS (inclusi gli stili per il nuovo menu) */
+  html,body { height:100%; margin:0; background:#081019; overflow:hidden; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  canvas { display:block; width:100%; height:100%; }
+  #ui {
+    position: absolute; left: 14px; top: 14px; color: #fff; z-index: 40;
+    text-shadow: 0 1px 0 rgba(0,0,0,.6);
+  }
+  #controls { opacity:0.9; font-size:14px; }
+  #score { font-size:18px; margin-top:6px; font-weight:700; }
+  
+  /* Stili per i menu (Start e Game Over) */
+  .modal {
+    position: absolute; left:50%; top:50%; transform: translate(-50%,-50%); z-index:100;
+    background: linear-gradient(180deg, rgba(20,24,30,0.98), rgba(10,12,18,0.98));
+    border: 1px solid rgba(255,255,255,0.06);
+    padding: 22px 28px; border-radius: 12px; text-align:center;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    color: #fff; min-width: 300px;
+  }
+  .modal h2 { margin:0 0 8px 0; font-size:22px; }
+  .modal p { margin:8px 0 18px 0; opacity:0.9; }
+  .btn { background:#2b7cff; border:none; color:white; padding:10px 16px; border-radius:8px; cursor:pointer; margin:0 8px; font-weight:700; font-size: 16px; }
+  .btn.ghost { background:transparent; border:1px solid rgba(255,255,255,0.12); }
+  
+  #gameover { display:none; } /* Nascosto di default */
+
+  #footerHint { position: absolute; right: 12px; bottom: 12px; color:#aab; font-size:13px; z-index:40; }
+</style>
+</head>
+<body>
+
+<canvas id="glcanvas"></canvas>
+
+<div id="startMenu" class="modal">
+  <h2>JetCube</h2>
+  <p>Usa la barra spaziatrice o tocca lo schermo per sopravvivere.</p>
+  <button id="btnStart" class="btn">Avvia Gioco</button>
+</div>
+
+<div id="ui">
+  <div id="controls">Premi <b>Space</b> o tocca lo schermo per usare il jetpack</div>
+  <div id="score">Score: 0</div>
+  <script src="music.js"></script> </div>
+
+<div id="gameover" class="modal">
+  <h2>Game Over</h2>
+  <p id="goMsg">Sei stato colpito! Vuoi ricominciare?</p>
+  <div>
+    <button id="btnRestart" class="btn">Ricomincia</button>
+    <button id="btnExit" class="btn ghost">Esci</button>
+  </div>
+</div>
+
+<div id="footerHint">Doppio clic per riavviare rapidamente</div>
+
+<script>
+// =========================
+// Minimal WebGL helpers
+// =========================
+function createShader(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error("Shader compile error:", gl.getShaderInfoLog(s));
+    console.log(src);
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+function createProgram(gl, vsSrc, fsSrc) {
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error("Program link error:", gl.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+
+// =========================
+// Shaders (improved material + soft occlusion approximation)
+// Notes:
+// - We use Blinn-Phong + fresnel/specular + rim + a simple occlusion term
+// - occlusion is approximated by sampling a few directions against a "fake" depth function
+//   (gives soft contact shadows look without heavy raytracing).
+// =========================
+const vsMesh = `
+attribute vec3 a_pos;
+attribute vec3 a_normal;
+uniform mat4 u_proj;
+uniform mat4 u_view;
+uniform mat4 u_model;
+varying vec3 v_worldPos;
+varying vec3 v_normal;
+void main(){
+  vec4 world = u_model * vec4(a_pos,1.0);
+  v_worldPos = world.xyz;
+  v_normal = normalize(mat3(u_model) * a_normal);
+  gl_Position = u_proj * u_view * world;
+}
+`;
+const fsMesh = `
+precision mediump float;
+varying vec3 v_worldPos;
+varying vec3 v_normal;
+uniform vec3 u_camPos;
+uniform vec3 u_baseColor;
+uniform float u_time;
+uniform vec3 u_lightDir;
+uniform float u_metal;
+uniform float u_rough;
+uniform float u_emissive;
+
+float fakeAO(vec3 p, vec3 n){
+  float nd = pow(max(dot(n, normalize(vec3(0.3,1.0,0.2))), 0.0), 1.5);
+  return clamp(nd, 0.4, 1.0);
+}
+
+void main(){
+    vec3 lightPos = vec3(-1, 0.4, 0.4);
+    vec3 N = normalize(v_normal);
+    vec3 L = normalize(lightPos - u_lightDir);
+    vec3 V = normalize(u_camPos - v_worldPos);
+    vec3 H = normalize(L + V);
+
+    // Diffuse
+    float diff = max(dot(N,L), 0.0);
+    float ao = fakeAO(v_worldPos, N);
+    vec3 diffuse = u_baseColor * diff * ao * 2.0;
+
+    // Specular + Fresnel
+    float specPower = mix(16.0, 128.0, 1.0 - u_rough);
+    float specularTerm = pow(max(dot(N,H),0.0), specPower) * 2.0;
+    vec3 F0 = mix(vec3(0.04), u_baseColor, u_metal);
+    vec3 fresnelTerm = F0 + (1.0 - F0) * pow(1.0 - max(dot(N,V),0.0),5.0);
+    vec3 specular = specularTerm * fresnelTerm;
+
+    // Rim lighting
+    vec3 rim = pow(1.0 - max(dot(N,V),0.0), 3.0) * 0.8 * vec3(1.0,0.85,0.7);
+
+    // Emissive + glow esterno
+    vec3 emissive = u_emissive * u_baseColor * 0.6;
+    vec3 emissiveGlow = pow(u_emissive * u_baseColor, vec3(1.5)) * 0.4;
+
+    // Combine all
+    vec3 color = diffuse + specular + rim + emissive + emissiveGlow;
+
+    // Bloom leggero
+    color += pow(emissive, vec3(1.2)) * 0.2;
+
+    // Tonemapping & gamma
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0/2.2));
+
+    gl_FragColor = vec4(color, 1.0);
+}
+
+
+`;
+
+// Particle shaders (point sprites)
+const vsParticle = `
+attribute vec2 a_pos;
+attribute vec2 a_offset;
+attribute float a_size;
+attribute float a_alpha;
+uniform mat4 u_proj;
+uniform mat4 u_view;
+uniform float u_pixelRatio;
+varying float v_alpha;
+void main(){
+  vec4 world = vec4(a_offset.x + a_pos.x * a_size, a_offset.y + a_pos.y * a_size, 0.0, 1.0);
+  gl_Position = u_proj * u_view * world;
+  gl_PointSize = a_size * u_pixelRatio;
+  v_alpha = a_alpha;
+}
+`;
+const fsParticle = `
+precision mediump float;
+varying float v_alpha;
+uniform vec3 u_color;
+void main(){
+  vec2 uv = gl_PointCoord - 0.5;
+  float d = length(uv);
+  float a = smoothstep(0.5, 0.42, d);
+  gl_FragColor = vec4(u_color, a * v_alpha);
+}
+`;
+
+// Wireframe grid shader
+const vsGrid = `
+attribute vec3 a_pos;
+uniform mat4 u_proj;
+uniform mat4 u_view;
+uniform mat4 u_model;
+void main(){
+  gl_Position = u_proj * u_view * u_model * vec4(a_pos, 1.0);
+}
+`;
+
+const fsGrid = `
+precision mediump float;
+uniform float u_time;
+uniform vec2 u_canvasSize;
+uniform float u_rainbowTime; // 0 = verde, >0 = rainbow
+
+void main() {
+    vec2 uv = gl_FragCoord.xy / u_canvasSize;
+    float pulse = 0.7 + 0.3 * sin(u_time * 2.0);
+    float edgeGlow = smoothstep(0.0, 0.05, fract(uv.x*20.0)) * smoothstep(0.0,0.05,fract(uv.y*20.0));
+
+    vec3 baseColor = vec3(0.0, 1.0, 0.0); // verde di default
+
+    if(u_rainbowTime > 0.0){
+        float t = u_time + u_rainbowTime;
+        baseColor = vec3(
+            0.5 + 0.5 * sin(t*2.0 + 0.0),
+            0.5 + 0.5 * sin(t*2.0 + 2.0),
+            0.5 + 0.5 * sin(t*2.0 + 4.0)
+        );
+        baseColor *= 1.5; // aumenta la luminosità
+    }
+
+    vec3 color = baseColor * (pulse + edgeGlow*0.5);
+    gl_FragColor = vec4(color, 0.7);
+}
+
+`;
+
+// =========================
+// GL init
+// =========================
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { antialias: true });
+
+// =========================
+// UI & Game Flow
+// =========================
+const startMenuEl = document.getElementById('startMenu');
+const btnStart = document.getElementById('btnStart');
+let gameRunning = false; // Flag per controllare se il gioco è attivo
+
+
+if (!gl) { alert("WebGL non disponibile"); }
+
+let DPR = window.devicePixelRatio || 1;
+function resize(){
+  DPR = window.devicePixelRatio || 1;
+  const w = Math.floor(innerWidth * DPR), h = Math.floor(innerHeight * DPR);
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = innerWidth + "px";
+  canvas.style.height = innerHeight + "px";
+  gl.viewport(0,0,w,h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const progMesh = createProgram(gl, vsMesh, fsMesh);
+const progParticle = createProgram(gl, vsParticle, fsParticle);
+const progGrid = createProgram(gl, vsGrid, fsGrid);
+
+// =========================
+// Geometry: box (3D) with normals
+// =========================
+function createBox(size=1){
+  const s = size/2;
+  const positions = [
+    -s,-s,-s,  s,-s,-s,  s,s,-s,  -s,s,-s, // back (-Z)
+    -s,-s,s,   s,-s,s,   s,s,s,   -s,s,s   // front (+Z)
+  ];
+  const p = [];
+  const n = [];
+  // build 6 faces
+  const face = (ax,ay,az, bx,by,bz, cx,cy,cz, dx,dy,dz, nx,ny,nz) => {
+    p.push(ax,ay,az, bx,by,bz, cx,cy,cz, dx,dy,dz);
+    for(let i=0;i<4;i++){ n.push(nx,ny,nz); }
+  };
+  const s2 = s;
+  // +X face
+  face( s2,-s2,-s2, s2,-s2,s2, s2,s2,s2, s2,s2,-s2, 1,0,0);
+  // -X
+  face(-s2,-s2,s2, -s2,-s2,-s2, -s2,s2,-s2, -s2,s2,s2, -1,0,0);
+  // +Y
+  face(-s2,s2,-s2, s2,s2,-s2, s2,s2,s2, -s2,s2,s2, 0,1,0);
+  // -Y
+  face(-s2,-s2,s2, s2,-s2,s2, s2,-s2,-s2, -s2,-s2,-s2, 0,-1,0);
+  // +Z front
+  face(-s2,-s2,s2, s2,-s2,s2, s2,s2,s2, -s2,s2,s2, 0,0,1);
+  // -Z back
+  face(s2,-s2,-s2, -s2,-s2,-s2, -s2,s2,-s2, s2,s2,-s2, 0,0,-1);
+
+  const idx = [];
+  for(let i=0;i<6;i++){
+    const o = i*4;
+    idx.push(o, o+1, o+2, o, o+2, o+3);
+  }
+  return { positions: new Float32Array(p), normals: new Float32Array(n), indices: new Uint16Array(idx) };
+}
+
+// Create wireframe grid geometry
+function createGrid(size, divisions) {
+  const positions = [];
+  const step = size / divisions;
+  const half = size / 2;
+  
+  // Horizontal lines
+  for (let i = 0; i <= divisions; i++) {
+    const y = -half + i * step;
+    positions.push(-half, y, 0, half, y, 0);
+  }
+  
+  // Vertical lines
+  for (let i = 0; i <= divisions; i++) {
+    const x = -half + i * step;
+    positions.push(x, -half, 0, x, half, 0);
+  }
+  
+  return new Float32Array(positions);
+}
+
+const box = createBox(1);
+const gridGeometry = createGrid(10000, 300);
+const musicThreshold = 23.7;
+
+const posVBO = gl.createBuffer();
+const normVBO = gl.createBuffer();
+const ibo = gl.createBuffer();
+const gridVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posVBO); gl.bufferData(gl.ARRAY_BUFFER, box.positions, gl.STATIC_DRAW);
+gl.bindBuffer(gl.ARRAY_BUFFER, normVBO); gl.bufferData(gl.ARRAY_BUFFER, box.normals, gl.STATIC_DRAW);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, box.indices, gl.STATIC_DRAW);
+
+// particles buffer
+const MAX_PARTICLES = 900;
+const particleBuffer = gl.createBuffer();
+
+// =========================
+// Game state and tuning
+// - adjust gravity/thrust units so jetpack is responsive
+// - camera higher: camYOffset negative so floor lower on screen
+// =========================
+const world = {
+  gravity: -2200, // pixels/sec^2
+  player: {
+    pos: { x: 120, y: 260 },
+    vel: { x: 260, y: 0 },
+    w: 34, h: 34,
+    alive: true,
+    color: [0.16, 0.8, 1.0],
+    onGround: false
+  },
+  camera: { x: 0, y: 0 },
+  floorY: 60,
+  obstacles: [],
+  audioStartTime: 0,
+  falling: [],
+  particles: [],
+  time: 0,
+  score: 0
+};
+
+// input
+let jetpackActive = false;
+window.addEventListener('keydown', e => { if (e.code === 'Space') jetpackActive = true; });
+window.addEventListener('keyup', e => { if (e.code === 'Space') jetpackActive = false; });
+canvas.addEventListener('pointerdown', e => { jetpackActive = true; });
+canvas.addEventListener('pointerup', e => { jetpackActive = false; });
+canvas.addEventListener('pointercancel', e => { jetpackActive = false; });
+
+
+// funzioni di rotazione degli ostacoli cadenti
+function mat4_rotateX(m, rad){
+  const c=Math.cos(rad), s=Math.sin(rad), r=new Float32Array(m);
+  const m4=r[4], m5=r[5], m6=r[6], m7=r[7],
+        m8=r[8], m9=r[9], m10=r[10], m11=r[11];
+  r[4]=m4*c+m8*s; r[5]=m5*c+m9*s; r[6]=m6*c+m10*s; r[7]=m7*c+m11*s;
+  r[8]=m8*c-m4*s; r[9]=m9*c-m5*s; r[10]=m10*c-m6*s; r[11]=m11*c-m7*s;
+  return r;
+}
+function mat4_rotateY(m, rad){
+  const c=Math.cos(rad), s=Math.sin(rad), r=new Float32Array(m);
+  const m0=r[0], m1=r[1], m2=r[2], m3=r[3],
+        m8=r[8], m9=r[9], m10=r[10], m11=r[11];
+  r[0]=m0*c-m8*s; r[1]=m1*c-m9*s; r[2]=m2*c-m10*s; r[3]=m3*c-m11*s;
+  r[8]=m0*s+m8*c; r[9]=m1*s+m9*c; r[10]=m2*s+m10*c; r[11]=m3*s+m11*c;
+  return r;
+}
+
+
+
+// spawn
+function spawnObstacle(x){
+  const w = 48 + Math.random()*110;
+  const h = 36 + Math.random()*150;
+  const y = world.floorY + h/2 + 10;
+  const hue = 0.2 + Math.random()*0.6;
+  const color = [0.7*hue, 0.4+0.5*Math.random(), 0.2+0.6*Math.random()];
+  world.obstacles.push({ x:x, y:y, z:-3, w:w, h:h, color: color });
+}
+
+// spawn falling
+function spawnFalling(x){
+  const size = 18 + Math.random()*44;
+  const xPos = x + Math.random()*500 - 250;
+
+  // spawn in alto, proporzionato all'altezza dello schermo
+  const minSpawnY = world.floorY + canvas.height * 0.6;
+  const maxSpawnY = world.floorY + canvas.height * 0.9;
+  const y = minSpawnY + Math.random() * (maxSpawnY - minSpawnY);
+
+  world.falling.push({
+    x: xPos,
+    y: y,
+    vx: -20 + Math.random()*40,
+    vy: -40 - Math.random()*120,
+    s: size,
+    color: [
+      0.9 * Math.random(),
+      0.2 + 0.6 * Math.random(),
+      0.4 + 0.5 * Math.random()
+    ],
+    emissive: 5.2,
+    rx: Math.random() * Math.PI*2, // rotazione iniziale X
+    ry: Math.random() * Math.PI*2, // rotazione iniziale Y
+    vrx: (Math.random()-0.5)*2.5, // velocità di rotazione X
+    vry: (Math.random()-0.5)*2.5  // velocità di rotazione Y
+  });
+
+}
+
+
+// initial level
+for(let i=1;i<9;i++) spawnObstacle(600 + i*320);
+for(let i=0;i<5;i++) spawnFalling(700 + i*400);
+
+// AABB collision
+function aabbOverlap(ax,ay,aw,ah, bx,by,bw,bh){
+  return Math.abs(ax-bx) * 2 < (aw + bw) && Math.abs(ay-by) * 2 < (ah + bh);
+}
+
+// particles
+function emitParticle(x,y,count,spread,baseVelY, color, strong){
+  for(let i=0;i<count;i++){
+    if (world.particles.length >= MAX_PARTICLES) break;
+    const ang = (Math.PI*1.1) + (Math.random()-0.5)*spread;
+    const speed = baseVelY * (0.6 + Math.random()*0.9);
+    world.particles.push({
+      x:x + (Math.random()-0.5)*12,
+      y:y + (Math.random()-0.5)*6,
+      vx: Math.cos(ang)*speed,
+      vy: Math.sin(ang)*speed,
+      size: (strong ? 12 : 6) * (0.6 + Math.random()*0.9),
+      life: 0.45 + Math.random()*0.7,
+      color: color.slice(),
+      alpha: 1
+    });
+  }
+}
+
+// =========================
+// Rendering helpers
+// =========================
+function setMeshAttribs(prog){
+  const aPos = gl.getAttribLocation(prog, "a_pos");
+  const aNorm = gl.getAttribLocation(prog, "a_normal");
+  gl.bindBuffer(gl.ARRAY_BUFFER, posVBO);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(aPos);
+  gl.bindBuffer(gl.ARRAY_BUFFER, normVBO);
+  gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(aNorm);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+}
+
+function mat4_ortho(left,right,bottom,top,near,far){
+  const rl = 1/(right-left), tb = 1/(top-bottom), nf = 1/(near-far);
+  return new Float32Array([
+    2*rl,0,0,0,
+    0,2*tb,0,0,
+    0,0,2*nf,0,
+    -(right+left)*rl, -(top+bottom)*tb, (far+near)*nf, 1
+  ]);
+}
+function mat4_identity(){ return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function mat4_translate(m, x,y,z){
+  const r = new Float32Array(m);
+  r[12] += x; r[13] += y; r[14] += z;
+  return r;
+}
+function mat4_scale(m, x,y,z){
+  const r = new Float32Array(m);
+  r[0]*=x; r[5]*=y; r[10]*=z;
+  return r;
+}
+
+
+function mat4_lookAt(eye, target, up){
+  const z0=eye[0]-target[0], z1=eye[1]-target[1], z2=eye[2]-target[2];
+  let len=Math.hypot(z0,z1,z2); const z=[z0/len,z1/len,z2/len];
+  const x=[up[1]*z[2]-up[2]*z[1], up[2]*z[0]-up[0]*z[2], up[0]*z[1]-up[1]*z[0]];
+  len=Math.hypot(...x); x[0]/=len; x[1]/=len; x[2]/=len;
+  const y=[ z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+  const out=new Float32Array(16);
+  out[0]=x[0]; out[1]=y[0]; out[2]=z[0]; out[3]=0;
+  out[4]=x[1]; out[5]=y[1]; out[6]=z[1]; out[7]=0;
+  out[8]=x[2]; out[9]=y[2]; out[10]=z[2]; out[11]=0;
+  out[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]);
+  out[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]);
+  out[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]);
+  out[15]=1;
+  return out;
+}
+
+
+// projection/view
+let projMat = mat4_identity();
+let viewMat = mat4_identity();
+let camWorldX = 0;
+let camWorldY = 0;
+
+function updateCamera(){
+  const vw = canvas.width / DPR;
+  const vh = canvas.height / DPR;
+
+  const camX = world.player.pos.x + 220;
+  const camY = world.floorY + vh*0.28;
+
+  // --- Zoom e shake dopo soglia musicale ---
+  let shakeX = 0, shakeY = 0;
+  let zoomFactor = 1.0;
+
+  const tAudio = world.time; // oppure tempo reale dall'audio
+  const musicThreshold = 23.7;
+
+  if (tAudio > musicThreshold){
+    // Zoom leggero
+    zoomFactor = 1.3; // 8% più vicino o più lontano
+    // Shake leggero
+    const shakeIntensity = 1.1; // pixel
+    shakeX = Math.sin(tAudio*30) * shakeIntensity * Math.random();
+    shakeY = Math.cos(tAudio*27) * shakeIntensity * Math.random();
+  }
+
+  world.camera.x = camX + shakeX;
+  world.camera.y = camY + shakeY;
+
+  camWorldX = world.camera.x;
+  camWorldY = world.camera.y;
+
+  const aspect = vw / vh;
+
+  // Prospettiva frontale
+  projMat = mat4_perspective(Math.PI/3 / zoomFactor, aspect, 0.1, 2000);
+
+  // Camera spostata indietro lungo Z per vedere il personaggio
+  const eye = [world.camera.x, world.camera.y, 800 * zoomFactor];
+  const target = [world.camera.x, world.camera.y, 0];
+  const up = [0,1,0];
+  viewMat = mat4_lookAt(eye, target, up);
+}
+
+
+// =========================
+// Draw functions
+// =========================
+gl.enable(gl.DEPTH_TEST);
+gl.disable(gl.CULL_FACE);
+
+function drawCube(prog, modelMat, color, metal=0.0, rough=0.7, emissive=0.0){
+  gl.useProgram(prog);
+  setMeshAttribs(prog);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_proj"), false, projMat);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_view"), false, viewMat);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_model"), false, modelMat);
+  gl.uniform3f(gl.getUniformLocation(prog, "u_camPos"), camWorldX, camWorldY, 600);
+  gl.uniform3fv(gl.getUniformLocation(prog, "u_baseColor"), color);
+  gl.uniform1f(gl.getUniformLocation(prog, "u_time"), world.time);
+  gl.uniform3fv(gl.getUniformLocation(prog, "u_lightDir"), [0.6,0.7,0.2]);
+  gl.uniform1f(gl.getUniformLocation(prog, "u_metal"), metal);
+  gl.uniform1f(gl.getUniformLocation(prog, "u_rough"), rough);
+  gl.uniform1f(gl.getUniformLocation(prog, "u_emissive"), emissive);
+
+  gl.drawElements(gl.TRIANGLES, box.indices.length, gl.UNSIGNED_SHORT, 0);
+}
+
+function drawNeonCloud(prog, modelMat){
+  gl.useProgram(prog);
+  setMeshAttribs(prog);
+
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_proj"), false, projMat);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_view"), false, viewMat);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "u_model"), false, modelMat);
+  gl.uniform1f(gl.getUniformLocation(prog, "u_time"), world.time);
+
+  // disabilitiamo il resto perché il colore è fisso nello shader
+  // non serve u_baseColor, u_metal, u_rough, u_emissive, u_lightDir
+
+  gl.drawElements(gl.TRIANGLES, box.indices.length, gl.UNSIGNED_SHORT, 0);
+}
+
+
+// particles
+function drawParticles(){
+  gl.useProgram(progParticle);
+  const pts = [];
+  const dt = 1/60; // o calcola delta time reale
+
+  for (let p of world.particles) {
+    // update fisica
+    p.vy -= 9.8 * dt; // gravità
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+
+    // collisione con pavimento
+    if (p.y - p.size/2 < world.floorY) {
+        p.y = world.floorY + p.size/2;
+        p.vy *= -0.5;
+        p.vx *= 0.98;
+    }
+
+    pts.push(0, 0, p.x, p.y, p.size, p.alpha);
+  }
+
+  const arr = new Float32Array(pts);
+  gl.bindBuffer(gl.ARRAY_BUFFER, particleBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
+
+  const a_pos = gl.getAttribLocation(progParticle, "a_pos");
+  const a_offset = gl.getAttribLocation(progParticle, "a_offset");
+  const a_size = gl.getAttribLocation(progParticle, "a_size");
+  const a_alpha = gl.getAttribLocation(progParticle, "a_alpha");
+
+  gl.enableVertexAttribArray(a_pos);
+  gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(a_offset);
+  gl.vertexAttribPointer(a_offset, 2, gl.FLOAT, false, 24, 8);
+  gl.enableVertexAttribArray(a_size);
+  gl.vertexAttribPointer(a_size, 1, gl.FLOAT, false, 24, 16);
+  gl.enableVertexAttribArray(a_alpha);
+  gl.vertexAttribPointer(a_alpha, 1, gl.FLOAT, false, 24, 20);
+
+  gl.uniformMatrix4fv(gl.getUniformLocation(progParticle, "u_proj"), false, projMat);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progParticle, "u_view"), false, viewMat);
+  gl.uniform3f(gl.getUniformLocation(progParticle, "u_color"), 1.0, 0.65, 0.25);
+  gl.uniform1f(gl.getUniformLocation(progParticle, "u_pixelRatio"), DPR);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.drawArrays(gl.POINTS, 0, arr.length / 6);
+  gl.disable(gl.BLEND);
+}
+
+// background layers (parallax animated)
+function drawBackground(){
+  // large distant blocks (3D scaled boxes) with slow parallax
+  const baseModel = mat4_identity();
+  const colors = [
+    [0.35,0.6,0.85], [0.45,0.8,0.5], [0.95,0.75,0.45], [0.8,0.45,0.7]
+  ];
+  for(let i=0;i<6;i++){
+    const x = world.player.pos.x + (i*900 - 1200) * (0.6 + 0.05*Math.sin(world.time*0.7 + i));
+    const y = world.floorY + 200 + ((i%2)? 40 : -40) + 8*Math.sin(world.time*1.2 + i*0.7);
+    const s = 260 + (i%3)*80;
+    const model = mat4_translate(baseModel, x, y, -300);
+    const m = mat4_scale(model, s, s*0.5, 30);
+    //drawNeonCloud(progMesh, m, [0.1,0.1,0.1]);
+    drawCube(progMesh, m, [0.01,0.01,0.01],8);
+    //drawWireCube(progMesh, m, colors[i%colors.length],8);
+  }
+  // moving clouds as semi-emissive cubes over top (fast parallax)
+  for(let i=0;i<12;i++){
+    const ox = (i*340 + (world.time*40*(1+ (i%3)*0.2))) % 4200 - 1200;
+    const x = world.player.pos.x + ox * 0.9;
+    const y = world.floorY + 420 + (i%2?30:-20) + 8*Math.sin(world.time*0.8 + i);
+    const model = mat4_translate(mat4_identity(), x, y, -220);
+    const m = mat4_scale(model, 220, 60, 8);
+    drawNeonCloud(progMesh, m, [0.1,0.1,0.1]);
+    //drawWireCube(progMesh, m, [0.95,0.95,0.98],8);
+  }
+}
+
+// ground extended to cover screen
+function drawGround(){
+  const vw = canvas.width / DPR;
+  const longW = 6000; // large extent
+  const model = mat4_translate(mat4_identity(), world.player.pos.x, world.floorY - 12, 0);
+  const m = mat4_scale(model, longW, 48, 28);
+  drawCube(progMesh, m, [0.18,0.7,0.35], 0.0, 0.7, 0.0);
+}
+
+// =========================
+// Main loop & physics
+// - important fix: jetpack thrust stronger than gravity so the player rises.
+// =========================
+let last = performance.now();
+
+function elasticEaseOut(t){
+  return Math.sin(-13 * (t+1) * Math.PI/2) * Math.pow(2, -10*t) + 1;
+}
+
+
+function step(now){
+
+  const dt = Math.min(0.033, (now - last)/1000);
+
+  last = now;
+  world.time += dt;
+  const tAudio = world.time; // oppure tempo reale dall'audio
+  
+  const dt2 = (now - last)/1000;
+  updateBackgroundColor(tAudio, dt2);
+
+
+  if (world.player.alive){
+    // horizontal motion
+    if (world.time > musicThreshold){
+      world.player.pos.x += world.player.vel.x * dt * 2;
+    }
+    else{
+      world.player.pos.x += world.player.vel.x * dt;
+    }
+
+    // jetpack thrust (fixed: positive upward)
+    if (jetpackActive){
+      world.player.vel.y += 2600 * dt; // increased thrust so you actually go up reliably
+      // strong particles
+      emitParticle(world.player.pos.x - 4, world.player.pos.y - 14, 5, 0.9, 260, [1.0,0.62,0.2], true);
+    } else {
+      // small floor particles when sliding
+      if (world.player.onGround && Math.abs(world.player.vel.x) > 10){
+        if (Math.random() < 0.35) emitParticle(world.player.pos.x - 6, world.player.pos.y - world.player.h/2 + 6, 1, 1.4, 90, [1.0,0.9,0.7], false);
+      }
+    }
+
+    // gravity
+    world.player.vel.y += world.gravity * dt;
+    world.player.pos.y += world.player.vel.y * dt;
+    
+    
+
+    // calcolo limite massimo in base allo spawn
+    let minSpawnY = world.floorY + canvas.height * 0.6;
+    let maxHeight = minSpawnY - 1; // margine di sicurezza
+
+    if (world.player.pos.y > maxHeight) {
+        world.player.pos.y = maxHeight;
+        if (world.player.vel.y > 0) {
+            world.player.vel.y = 0.0;
+        }
+    }
+    
+
+    // ground
+    const groundY = world.floorY + world.player.h/2;
+    if (world.player.pos.y <= groundY){
+      world.player.pos.y = groundY;
+      world.player.vel.y = 0;
+      world.player.onGround = true;
+    } else {
+      world.player.onGround = false;
+    }
+
+    // spawn obstacles & falling
+    const lastObsX = world.obstacles.length ? world.obstacles[world.obstacles.length-1].x : 0;
+    if (lastObsX < world.player.pos.x + 1700) spawnObstacle(lastObsX + 300 + Math.random()*360);
+    if (Math.random() < 0.018) spawnFalling(world.player.pos.x + 900);
+    
+    // move obstacles with the music
+    const tAudio = (now/1000) - (world.audioStartTime || 0);
+  
+    if (tAudio > musicThreshold) {
+      const beatDuration = 60 / 82; // ~0.732 secondi
+      const beatIndex = Math.floor((tAudio - musicThreshold) / beatDuration);
+      const beatPhase = ((tAudio - musicThreshold) % beatDuration) / beatDuration; // [0,1]
+  
+      for (let o of world.obstacles) {
+        if (o.baseH === undefined) o.baseH = o.h;
+
+        // ogni beat alterna direzione
+        const dir = (beatIndex % 2 === 0) ? 1 : -1;
+
+        // interpolazione [0..1] con overshoot elastico
+        const anim = elasticEaseOut(beatPhase);
+
+        // variazione max: 40% dell’altezza
+        const delta = o.baseH * 0.4 * dir;
+
+        o.h = o.baseH + delta * anim;
+
+        // base resta ferma → y invariato
+      }
+
+    }
+    
+
+
+
+    // update falling
+    for(let f of world.falling){
+      f.vy += world.gravity * dt * 0.0025;
+      f.x += f.vx * dt;
+      f.y += f.vy * dt;
+
+      // aggiorna le rotazioni
+      f.rx += f.vrx * dt;
+      f.ry += f.vry * dt;
+    }
+    world.falling = world.falling.filter(f => f.y > world.floorY - 360);
+
+    // collisions
+    for(let o of world.obstacles){
+      if (aabbOverlap(world.player.pos.x, world.player.pos.y, world.player.w, world.player.h, o.x, o.y, o.w, o.h)){
+        world.player.alive = false;
+        showGameOver();
+        break;
+      }
+    }
+    for(let f of world.falling){
+      if (aabbOverlap(world.player.pos.x, world.player.pos.y, world.player.w, world.player.h, f.x, f.y, f.s, f.s)){
+        world.player.alive = false;
+        showGameOver();
+        break;
+      }
+    }
+
+    // score
+    world.score = Math.floor(world.player.pos.x / 10);
+    document.getElementById('score').textContent = "Score: " + world.score;
+  } else {
+    // dead: slow fall
+    world.player.vel.y -= 220 * dt;
+    world.player.pos.y += world.player.vel.y * dt;
+  }
+
+  // particles update
+  for(let i=world.particles.length-1;i>=0;i--){
+    const p = world.particles[i];
+    p.vx *= 0.985;
+    p.vy -= 520 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    p.alpha = Math.max(0, p.life / 1.0);
+    if (p.life <= 0) world.particles.splice(i,1);
+  }
+
+  // trim obstacles behind
+  world.obstacles = world.obstacles.filter(o => o.x > world.player.pos.x - 900);
+
+  updateCamera();
+  render();
+  requestAnimationFrame(step);
+}
+
+// =========================
+// Render entire scene
+// =========================
+function clearColor(r,g,b){
+  gl.clearColor(r,g,b,1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+}
+
+
+
+// Draw wireframe grid
+function drawGrid() {
+  gl.useProgram(progGrid);
+  
+  // Set up grid attributes
+  gl.bindBuffer(gl.ARRAY_BUFFER, gridVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, gridGeometry, gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(progGrid, "a_pos");
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(aPos);
+  
+  // Calculate aspect ratio to maintain square grid cells
+  const vw = canvas.width / DPR;
+  const vh = canvas.height / DPR;
+  const aspectRatio = vw / vh;
+  
+  // Multiple grid layers for depth
+  const layers = [
+    { z: -50, x: 100, scale: 3.0, alpha: 0.3 },
+  ];
+  
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  
+  for (let layer of layers) {
+    const model = mat4_translate(mat4_identity(), world.player.pos.x * 0.1, world.floorY - 200, layer.z);
+    // Apply aspect ratio correction to maintain square cells
+    const scaledModel = mat4_scale(model, layer.scale * aspectRatio, layer.scale, 1);
+    
+    gl.uniformMatrix4fv(gl.getUniformLocation(progGrid, "u_proj"), false, projMat);
+    gl.uniformMatrix4fv(gl.getUniformLocation(progGrid, "u_view"), false, viewMat);
+    gl.uniformMatrix4fv(gl.getUniformLocation(progGrid, "u_model"), false, scaledModel);
+    
+    const rainbowThreshold = musicThreshold; // secondi dall'inizio della musica
+    const rainbowTime = Math.max(0, world.time - rainbowThreshold);
+    gl.uniform1f(gl.getUniformLocation(progGrid, "u_rainbowTime"), rainbowTime);
+    
+    gl.drawArrays(gl.LINES, 0, gridGeometry.length / 3);
+  }
+  
+  gl.disable(gl.BLEND);
+}
+
+
+function mat4_perspective(fov, aspect, near, far){
+  const f = 1.0 / Math.tan(fov/2);
+  const nf = 1/(near - far);
+  const out = new Float32Array(16);
+  out[0] = f/aspect; out[1]=0; out[2]=0; out[3]=0;
+  out[4]=0; out[5]=f; out[6]=0; out[7]=0;
+  out[8]=0; out[9]=0; out[10]=(far+near)*nf; out[11]=-1;
+  out[12]=0; out[13]=0; out[14]=2*far*near*nf; out[15]=0;
+  return out;
+}
+
+
+
+// colori sfondo
+const colorNormal = [0.02, 0.05, 0.08];
+const colorMusic = [0.4, 0.6, 0.4];
+const white = [1.0, 1.0, 1.0];
+
+// stato globale
+let bgColor = colorNormal.slice();
+let ramping = false;
+let rampProgress = 0; // 0->1 per il ramp up
+
+function updateBackgroundColor(tAudio, dt) {
+    if (tAudio > musicThreshold) {
+        // inizio ramp up se non attivo
+        if(!ramping) { ramping = true; rampProgress = 0; }
+        
+        if(rampProgress < 1.0){
+            // ramp rapido verso bianco
+            rampProgress += dt * 5.0; // velocità ramp up
+            for(let i=0;i<3;i++){
+                bgColor[i] = colorMusic[i] + (white[i]-colorMusic[i])*rampProgress;
+            }
+        } else {
+            // fade lento verso il colore target
+            const fadeSpeed = 1.5; 
+            for(let i=0;i<3;i++){
+                bgColor[i] += (colorMusic[i]-bgColor[i])*fadeSpeed*dt;
+            }
+        }
+    } else {
+        // ritorno normale
+        ramping = false;
+        const fadeSpeed = 2.0;
+        for(let i=0;i<3;i++){
+            bgColor[i] += (colorNormal[i]-bgColor[i])*fadeSpeed*dt;
+        }
+    }
+
+    clearColor(bgColor[0], bgColor[1], bgColor[2]);
+}
+
+
+
+function render(){
+  
+  
+  // Draw wireframe grid background (quadrettoni con bordi luminosi)
+  drawGrid();
+
+  // background decorations (parallax)
+  drawBackground();
+
+  // ground
+  drawGround();
+
+  // obstacles (draw as 3D boxes)
+  for(let o of world.obstacles){
+    const model = mat4_translate(mat4_identity(), o.x, o.y, o.z || 0);
+
+    const sx = o.w; const sy = o.h; const sz = 34;
+    const m = mat4_scale(model, sx, sy, sz);
+    drawCube(progMesh, m, o.color, 0.0, 0.7, 0.0);
+  }
+  // falling
+  for (let f of world.falling) {
+    let model = mat4_identity();
+
+    // 1. scala uniforme prima di qualsiasi rotazione
+    const s = f.s;
+    model = mat4_scale(model, s, s, s);
+
+    // 2. applica le rotazioni
+    model = mat4_rotateX(model, f.rx);
+    model = mat4_rotateY(model, f.ry);
+    //model = mat4_rotateZ(model, f.rz || 0);
+
+    // 3. trasla alla posizione del cubo
+    model = mat4_translate(model, f.x, f.y, 0);
+
+    drawCube(progMesh, model, f.color, 0.05, 0.6, 1.7);
+  }
+
+
+
+  // player cube (3D scaling)
+  const p = world.player;
+  const pm = mat4_translate(mat4_identity(), p.pos.x, p.pos.y + 8, 0);
+  const pm2 = mat4_scale(pm, p.w, p.h, 50);
+  // more emissive when in air
+  drawCube(progMesh, pm2, p.color, 0.0, 0.35, p.onGround ? 0.0 : 0.18);
+
+  // particles
+  drawParticles();
+}
+
+
+// =========================
+// Game Over UI
+// =========================
+const gameOverEl = document.getElementById('gameover');
+const btnRestart = document.getElementById('btnRestart');
+const btnExit = document.getElementById('btnExit');
+
+function showGameOver(){
+  document.getElementById('goMsg').textContent = "Sei stato colpito! Score: " + world.score;
+  gameOverEl.style.display = "block";
+  muffleAudio(); // <-- Applica l'effetto audio ovattato
+}
+
+function hideGameOver(){ gameOverEl.style.display = "none"; }
+
+btnRestart.addEventListener('click', () => {
+  restartGame();
+  hideGameOver();
+});
+btnExit.addEventListener('click', () => {
+  // just hide modal; you can later add menu navigation
+  hideGameOver();
+});
+
+// restart helper
+function restartGame(){
+  unmuffleAudio(); // <-- Riporta l'audio alla normalità
+  world.player.pos.x = 120; world.player.pos.y = 260; world.player.vel.x = 260; world.player.vel.y = 0; world.player.alive = true;
+  world.obstacles = []; world.falling = []; world.particles = [];
+  for(let i=1;i<9;i++) spawnObstacle(600 + i*320);
+  for(let i=0;i<5;i++) spawnFalling(700 + i*400);
+  world.score = 0;
+  document.getElementById('score').textContent = "Score: 0";
+  hideGameOver();
+}
+
+// double click quick restart
+canvas.addEventListener('dblclick', () => {
+  restartGame();
+});
+
+
+// Gestisce l'avvio del gioco
+btnStart.addEventListener('click', async () => {
+  startMenuEl.style.display = 'none'; // Nasconde il menu
+  
+  // Avvia la musica (richiede un'interazione utente, che abbiamo appena avuto)
+  await startAudio(); 
+  world.audioStartTime = performance.now()/1000
+  
+  // Avvia il game loop
+  if (!gameRunning) {
+    gameRunning = true;
+    last = performance.now(); // Resetta il tempo per il primo frame
+    requestAnimationFrame(step);
+  }
+});
+
+</script>
+</body>
+</html>
+
